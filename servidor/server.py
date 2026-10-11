@@ -8,6 +8,10 @@ devuelve el audio de respuesta (PCM 16-bit, 24 kHz, mono) a la ESP32.
 Mensajes de texto hacia la ESP32 (JSON):
   {"state": "speaking"}   -> empieza a hablar (la ESP32 deja de escuchar)
   {"state": "listening"}  -> terminó de hablar (la ESP32 vuelve a escuchar)
+
+Google corta cada conexión de Live API a los ~10 minutos. Este servidor usa
+"reanudación de sesión" para abrir una conexión nueva sin perder la conversación,
+sin que la ESP32 se entere.
 """
 
 import asyncio
@@ -18,6 +22,7 @@ import os
 import time
 from collections import deque
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, WebSocket
 from google import genai
@@ -29,8 +34,11 @@ log = logging.getLogger("robot")
 # ---------------- Configuración (variables de entorno) ----------------
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]          # obligatoria
 ROBOT_KEY = os.environ.get("ROBOT_KEY", "")            # clave compartida con la ESP32
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-native-audio-latest")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-live")
 VOICE = os.environ.get("GEMINI_VOICE", "Puck")         # Puck, Kore, Charon, Aoede, Fenrir...
+# Si el modelo rechaza alguno de estos extras, ponlos en 0 desde Render.
+USE_TRANSCRIPTS = os.environ.get("GEMINI_TRANSCRIPTS", "1") == "1"   # muestra "Tú:" y "Robot:" en los logs
+USE_COMPRESSION = os.environ.get("GEMINI_COMPRESSION", "1") == "1"   # conversaciones largas sin límite
 # Filtro de silencio: 0 = desactivado (enviar todo el audio a Gemini).
 # Si lo activas (ej. 300), solo se envía audio cuando hay voz, para gastar menos cuota.
 GATE_RMS = int(os.environ.get("GATE_RMS", "0"))
@@ -62,7 +70,7 @@ def build_system_prompt() -> str:
     )
 
 
-def build_config() -> types.LiveConnectConfig:
+def build_config(handle: Optional[str]) -> types.LiveConnectConfig:
     kwargs = dict(
         response_modalities=["AUDIO"],
         system_instruction=build_system_prompt(),
@@ -71,13 +79,16 @@ def build_config() -> types.LiveConnectConfig:
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE)
             )
         ),
-        input_audio_transcription=types.AudioTranscriptionConfig(),
-        output_audio_transcription=types.AudioTranscriptionConfig(),
-        # Permite conversaciones largas sin que la sesión expire.
-        context_window_compression=types.ContextWindowCompressionConfig(
-            sliding_window=types.SlidingWindow()
-        ),
+        # Permite retomar la conversación al abrir una conexión nueva.
+        session_resumption=types.SessionResumptionConfig(handle=handle),
     )
+    if USE_TRANSCRIPTS:
+        kwargs["input_audio_transcription"] = types.AudioTranscriptionConfig()
+        kwargs["output_audio_transcription"] = types.AudioTranscriptionConfig()
+    if USE_COMPRESSION:
+        kwargs["context_window_compression"] = types.ContextWindowCompressionConfig(
+            sliding_window=types.SlidingWindow()
+        )
     return types.LiveConnectConfig(**kwargs)
 
 
@@ -92,12 +103,34 @@ def rms_int16(data: bytes) -> float:
 
 @app.get("/")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "model": MODEL}
 
 
-# ---------------- Tareas de una conexión ----------------
-async def robot_to_gemini(ws: WebSocket, session):
-    """Audio del micrófono (ESP32) -> Gemini."""
+# ---------------- Tareas ----------------
+async def read_robot(ws: WebSocket, in_q: asyncio.Queue, closed: asyncio.Event):
+    """Lee el audio de la ESP32 durante toda la conexión, aunque Gemini se esté renovando."""
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg["type"] == "websocket.disconnect":
+                break
+            data = msg.get("bytes")
+            if not data:
+                continue
+            if in_q.full():  # si Gemini se está reconectando, se descarta lo más viejo
+                try:
+                    in_q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            in_q.put_nowait(data)
+    except Exception as e:  # noqa: BLE001
+        log.info("Lectura de la ESP32 terminó: %r", e)
+    finally:
+        closed.set()
+
+
+async def send_to_gemini(session, in_q: asyncio.Queue):
+    """Audio del micrófono -> Gemini (con filtro de silencio opcional)."""
     preroll = deque(maxlen=PREROLL_CHUNKS)
     last_voice = 0.0
     gate_open = False
@@ -108,20 +141,14 @@ async def robot_to_gemini(ws: WebSocket, session):
         )
 
     while True:
-        msg = await ws.receive()
-        if msg["type"] == "websocket.disconnect":
-            return
-        data = msg.get("bytes")
-        if not data:
-            continue
+        data = await in_q.get()
 
         if GATE_RMS <= 0:
             await send(data)
             continue
 
         now = time.monotonic()
-        level = rms_int16(data)
-        if level >= GATE_RMS:
+        if rms_int16(data) >= GATE_RMS:
             last_voice = now
         if now - last_voice <= GATE_HANGOVER_S:
             if not gate_open:
@@ -135,10 +162,18 @@ async def robot_to_gemini(ws: WebSocket, session):
             preroll.append(data)
 
 
-async def gemini_to_queue(session, out_q: asyncio.Queue):
+async def gemini_to_queue(session, out_q: asyncio.Queue, holder: dict):
     """Respuestas de Gemini -> cola de audio hacia la ESP32."""
     while True:
         async for resp in session.receive():
+            # Guardar el identificador que permite retomar la conversación.
+            sru = getattr(resp, "session_resumption_update", None)
+            if sru is not None and getattr(sru, "new_handle", None):
+                holder["handle"] = sru.new_handle
+            ga = getattr(resp, "go_away", None)
+            if ga is not None:
+                log.info("Google avisa que va a cerrar la conexión (quedan %s)", getattr(ga, "time_left", "?"))
+
             sc = resp.server_content
             if resp.data:
                 await out_q.put(resp.data)
@@ -196,24 +231,56 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     log.info("ESP32 conectada")
 
+    in_q: asyncio.Queue = asyncio.Queue(maxsize=200)   # ~6 s de audio de la ESP32
+    closed = asyncio.Event()
+    reader = asyncio.create_task(read_robot(ws, in_q, closed))
+    holder = {"handle": None}
+    quick_failures = 0
+
     try:
-        async with client.aio.live.connect(model=MODEL, config=build_config()) as session:
-            log.info("Sesión Gemini Live abierta (%s)", MODEL)
-            out_q: asyncio.Queue = asyncio.Queue()
-            tasks = [
-                asyncio.create_task(robot_to_gemini(ws, session)),
-                asyncio.create_task(gemini_to_queue(session, out_q)),
-                asyncio.create_task(queue_to_robot(ws, out_q)),
-            ]
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for t in pending:
-                t.cancel()
-            for t in done:
-                if t.exception():
-                    log.error("Error en tarea: %r", t.exception())
-    except Exception as e:  # noqa: BLE001
-        log.error("Error con Gemini: %r", e)
+        while not closed.is_set():
+            started = time.monotonic()
+            try:
+                async with client.aio.live.connect(
+                    model=MODEL, config=build_config(holder["handle"])
+                ) as session:
+                    log.info(
+                        "Sesión Gemini Live abierta (%s, %s)",
+                        MODEL,
+                        "retomada" if holder["handle"] else "nueva",
+                    )
+                    out_q: asyncio.Queue = asyncio.Queue()
+                    await ws.send_text('{"state":"listening"}')
+                    tasks = [
+                        asyncio.create_task(send_to_gemini(session, in_q)),
+                        asyncio.create_task(gemini_to_queue(session, out_q, holder)),
+                        asyncio.create_task(queue_to_robot(ws, out_q)),
+                        asyncio.create_task(closed.wait()),
+                    ]
+                    done, pending = await asyncio.wait(
+                        tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for t in pending:
+                        t.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    for t in done:
+                        if not t.cancelled() and t.exception():
+                            log.warning("La conexión con Gemini terminó: %r", t.exception())
+            except Exception as e:  # noqa: BLE001
+                log.error("Error con Gemini: %r", e)
+
+            if closed.is_set():
+                break
+
+            quick_failures = quick_failures + 1 if time.monotonic() - started < 5 else 0
+            if quick_failures >= 3:
+                log.error("Gemini rechaza la conexión repetidamente; se cierra la conexión con la ESP32")
+                await asyncio.sleep(10)  # evita que la ESP32 reintente de inmediato
+                break
+            log.info("Renovando la conexión con Gemini...")
+            await asyncio.sleep(0.3)
     finally:
+        reader.cancel()
         log.info("ESP32 desconectada")
         try:
             await ws.close()
