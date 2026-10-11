@@ -53,6 +53,7 @@ LLM_MODEL = os.environ.get("GROQ_LLM_MODEL", "openai/gpt-oss-120b")
 TTS_VOICE = os.environ.get("TTS_VOICE", "es-CL-CatalinaNeural")
 TTS_RATE = os.environ.get("TTS_RATE", "+8%")
 
+VAD_DEBUG = os.environ.get("VAD_DEBUG", "1") == "1"        # muestra el nivel del micrófono en reposo
 VAD_MIN_RMS = int(os.environ.get("VAD_MIN_RMS", "350"))
 VAD_MULT = float(os.environ.get("VAD_MULT", "3.0"))        # umbral = ruido de fondo x esto
 END_SILENCE_MS = int(os.environ.get("END_SILENCE_MS", "600"))
@@ -90,12 +91,30 @@ def build_system_prompt() -> str:
 
 # ---------------- Utilidades de audio ----------------
 def rms_int16(data: bytes) -> float:
+    """Volumen de un trozo de audio, ignorando el desfase constante (DC) que traen algunos micrófonos."""
     n = len(data) // 2
     if n == 0:
         return 0.0
     samples = array.array("h")
     samples.frombytes(data[: n * 2])
-    return math.sqrt(sum(s * s for s in samples) / n)
+    mean = sum(samples) / n
+    return math.sqrt(sum((s - mean) ** 2 for s in samples) / n)
+
+
+def remove_dc(pcm: bytes) -> bytes:
+    """Quita el desfase constante del audio antes de mandarlo a Whisper."""
+    n = len(pcm) // 2
+    if n == 0:
+        return pcm
+    s = array.array("h")
+    s.frombytes(pcm[: n * 2])
+    mean = int(sum(s) / n)
+    if abs(mean) < 8:
+        return pcm
+    for i in range(n):
+        v = s[i] - mean
+        s[i] = 32767 if v > 32767 else (-32768 if v < -32768 else v)
+    return s.tobytes()
 
 
 def pcm_to_wav(pcm: bytes, rate: int) -> bytes:
@@ -114,6 +133,7 @@ class Segmenter:
     def __init__(self):
         self.pending = bytearray()
         self.noise = 150.0
+        self.idle_frames = 0
         self._clear()
 
     def _clear(self):
@@ -148,6 +168,13 @@ class Segmenter:
 
         if not self.in_speech:
             self.pre.append(frame)
+            if VAD_DEBUG:
+                self.idle_frames += 1
+                if self.idle_frames % 200 == 0:      # cada ~6 s
+                    log.info(
+                        "Micrófono en reposo: nivel %.0f, ruido de fondo %.0f, umbral %.0f",
+                        level, self.noise, threshold,
+                    )
             if not voiced:
                 self.noise = 0.97 * self.noise + 0.03 * level
                 self.run_voiced = 0
@@ -185,7 +212,7 @@ class Segmenter:
 
 # ---------------- Oír, pensar, hablar ----------------
 async def transcribe(pcm: bytes, rate: int = IN_RATE) -> str:
-    wav = pcm_to_wav(pcm, rate)
+    wav = pcm_to_wav(remove_dc(pcm), rate)
     r = await client.audio.transcriptions.create(
         file=("audio.wav", wav), model=STT_MODEL, language="es", temperature=0.0
     )
@@ -254,11 +281,15 @@ def _decode_mp3(mp3: bytes) -> bytes:
 
 
 async def tts_pcm(text: str) -> bytes:
-    com = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
     mp3 = bytearray()
-    async for ch in com.stream():
-        if ch["type"] == "audio":
-            mp3 += ch["data"]
+
+    async def collect():
+        com = edge_tts.Communicate(text, TTS_VOICE, rate=TTS_RATE)
+        async for ch in com.stream():
+            if ch["type"] == "audio":
+                mp3.extend(ch["data"])
+
+    await asyncio.wait_for(collect(), timeout=10)    # si la voz se cuelga, se salta esa oración
     if not mp3:
         raise RuntimeError("la voz no devolvió audio")
     return await asyncio.to_thread(_decode_mp3, bytes(mp3))
@@ -305,8 +336,8 @@ async def run_turn(ws: WebSocket, session: dict, pcm: bytes):
     try:
         text = await transcribe(pcm)
         t_stt = time.monotonic() - t_start
-        if len(text) < 2:
-            log.info("(no se entendió nada, se ignora)")
+        if len(re.sub(r"[\W_]+", "", text)) < 2:     # vacío o solo "..." / signos
+            log.info("(no se entendió nada, se ignora: %r)", text)
             return
         log.info("Tú: %s   [oír: %.1f s]", text, t_stt)
 
@@ -355,7 +386,7 @@ async def run_turn(ws: WebSocket, session: dict, pcm: bytes):
         await spk.finish()
 
         reply = " ".join(reply_parts)
-        log.info("Robot: %s", reply)
+        log.info("Robot: %s   [turno completo: %.1f s]", reply, time.monotonic() - t_start)
         history.append({"role": "assistant", "content": reply})
 
     except asyncio.CancelledError:
