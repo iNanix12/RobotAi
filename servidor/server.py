@@ -106,6 +106,45 @@ async def health():
     return {"ok": True, "model": MODEL}
 
 
+@app.get("/diag")
+async def diag(key: str = ""):
+    """Diagnóstico: abre https://TU-APP.onrender.com/diag?key=TU_ROBOT_KEY en el navegador.
+    No revela la clave de Gemini. Muestra qué modelos de voz ve tu clave y si logra conectarse."""
+    if ROBOT_KEY and key != ROBOT_KEY:
+        return {"error": "falta ?key=TU_ROBOT_KEY"}
+
+    out: dict = {"modelo_configurado": MODEL}
+
+    # 1) ¿La clave puede consultar modelos? ¿Cuáles soportan voz en tiempo real?
+    live_models = []
+    try:
+        pager = await client.aio.models.list()
+        async for m in pager:
+            actions = getattr(m, "supported_actions", None) or []
+            if "bidiGenerateContent" in actions:
+                live_models.append((m.name or "").replace("models/", ""))
+        out["clave_puede_listar_modelos"] = True
+        out["modelos_con_voz_en_tiempo_real"] = live_models
+    except Exception as e:  # noqa: BLE001
+        out["clave_puede_listar_modelos"] = False
+        out["error_al_listar"] = repr(e)[:300]
+
+    # 2) Probar abrir una conexión Live con el modelo configurado y con los que aparezcan.
+    candidates = list(dict.fromkeys([MODEL] + live_models))[:6]
+    results = {}
+    for name in candidates:
+        try:
+            async with client.aio.live.connect(
+                model=name,
+                config=types.LiveConnectConfig(response_modalities=["AUDIO"]),
+            ):
+                results[name] = "OK: conecta"
+        except Exception as e:  # noqa: BLE001
+            results[name] = "FALLA: " + repr(e)[:200]
+    out["prueba_de_conexion_live"] = results
+    return out
+
+
 # ---------------- Tareas ----------------
 async def read_robot(ws: WebSocket, in_q: asyncio.Queue, closed: asyncio.Event):
     """Lee el audio de la ESP32 durante toda la conexión, aunque Gemini se esté renovando."""
