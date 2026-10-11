@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+groq>=0.13
+edge-tts>=6.1
+miniaudio>=1.60
+google-genai>=1.0
