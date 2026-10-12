@@ -70,7 +70,7 @@ IN_RATE = 16000               # lo que envía la ESP32
 OUT_RATE = 24000              # lo que reproduce la ESP32
 FRAME_BYTES = 960             # 30 ms de audio a 16 kHz
 LEAD_S = 0.4                  # audio adelantado permitido en el buffer de la ESP32
-SLICE_BYTES = 4096            # tamaño de cada trozo enviado a la ESP32
+SLICE_BYTES = 1024            # tamaño de cada trozo enviado a la ESP32 (chico = no se fragmenta)
 
 BASE_DIR = Path(__file__).parent
 client = AsyncGroq(api_key=GROQ_API_KEY)
