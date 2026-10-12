@@ -1,6 +1,7 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
 groq>=0.13
-edge-tts>=6.1
+edge-tts>=7.2.8
+gTTS>=2.5
 miniaudio>=1.60
 google-genai>=1.0
