@@ -57,7 +57,12 @@ VAD_DEBUG = os.environ.get("VAD_DEBUG", "1") == "1"        # muestra el nivel de
 VAD_MIN_RMS = int(os.environ.get("VAD_MIN_RMS", "350"))
 VAD_MULT = float(os.environ.get("VAD_MULT", "3.0"))        # umbral = ruido de fondo x esto
 END_SILENCE_MS = int(os.environ.get("END_SILENCE_MS", "600"))
-MIN_SPEECH_MS = 300           # frases más cortas se descartan (clics, golpes)
+# Frases que Whisper inventa cuando recibe silencio o ruido
+HALLUCINATIONS = (
+    "gracias por ver", "suscríbete", "suscribete", "subtítulos realizados",
+    "subtitulado por", "amara.org",
+)
+MIN_SPEECH_MS = 300          # frases más cortas se descartan (clics, golpes)
 MAX_UTTERANCE_S = 15          # corta frases larguísimas
 MAX_HISTORY = 12              # mensajes de memoria de la conversación
 
@@ -199,7 +204,12 @@ class Segmenter:
         too_long = len(self.speech) >= MAX_UTTERANCE_S * IN_RATE * 2
         if self.silence_frames * 30 >= END_SILENCE_MS or too_long:
             speech_ms = self.voiced_frames * 30
-            out = bytes(self.speech) if speech_ms >= MIN_SPEECH_MS else None
+            out = bytes(self.speech) if (speech_ms >= MIN_SPEECH_MS and not too_long) else None
+            if too_long:
+                log.warning(
+                    "Ruido continuo de %d s (nivel pico %.0f): se descarta. Revisa el micrófono.",
+                    MAX_UTTERANCE_S, self.peak,
+                )
             if out:
                 log.info(
                     "Voz detectada: %.1f s (pico %.0f, ruido de fondo %.0f)",
@@ -280,7 +290,10 @@ def _decode_mp3(mp3: bytes) -> bytes:
     return dec.samples.tobytes()
 
 
-async def tts_pcm(text: str) -> bytes:
+_edge_bad_until = 0.0     # si Edge TTS falla, se usa la voz de respaldo un rato sin reintentar
+
+
+async def _edge_mp3(text: str) -> bytes:
     mp3 = bytearray()
 
     async def collect():
@@ -289,10 +302,41 @@ async def tts_pcm(text: str) -> bytes:
             if ch["type"] == "audio":
                 mp3.extend(ch["data"])
 
-    await asyncio.wait_for(collect(), timeout=10)    # si la voz se cuelga, se salta esa oración
+    await asyncio.wait_for(collect(), timeout=6)
     if not mp3:
-        raise RuntimeError("la voz no devolvió audio")
-    return await asyncio.to_thread(_decode_mp3, bytes(mp3))
+        raise RuntimeError("Edge TTS no devolvió audio")
+    return bytes(mp3)
+
+
+def _gtts_mp3_sync(text: str) -> bytes:
+    from gtts import gTTS
+    buf = io.BytesIO()
+    gTTS(text=text, lang="es", tld="com.mx").write_to_fp(buf)
+    return buf.getvalue()
+
+
+async def _gtts_mp3(text: str) -> bytes:
+    data = await asyncio.wait_for(asyncio.to_thread(_gtts_mp3_sync, text), timeout=8)
+    if not data:
+        raise RuntimeError("gTTS no devolvió audio")
+    return data
+
+
+async def tts_pcm(text: str, engine: str = "auto") -> bytes:
+    """Convierte texto a audio. 'auto': Edge TTS (voz chilena) y, si falla, gTTS (voz de respaldo)."""
+    global _edge_bad_until
+    mp3 = None
+    if engine in ("auto", "edge") and (engine == "edge" or time.monotonic() >= _edge_bad_until):
+        try:
+            mp3 = await _edge_mp3(text)
+        except Exception as e:  # noqa: BLE001
+            if engine == "edge":
+                raise
+            _edge_bad_until = time.monotonic() + 120
+            log.warning("Edge TTS falló (%s); uso la voz de respaldo durante 2 min", type(e).__name__)
+    if mp3 is None:
+        mp3 = await _gtts_mp3(text)
+    return await asyncio.to_thread(_decode_mp3, mp3)
 
 
 class Speaker:
@@ -338,6 +382,9 @@ async def run_turn(ws: WebSocket, session: dict, pcm: bytes):
         t_stt = time.monotonic() - t_start
         if len(re.sub(r"[\W_]+", "", text)) < 2:     # vacío o solo "..." / signos
             log.info("(no se entendió nada, se ignora: %r)", text)
+            return
+        if any(h in text.lower() for h in HALLUCINATIONS):
+            log.info("(Whisper inventó texto por ruido, se ignora: %r)", text)
             return
         log.info("Tú: %s   [oír: %.1f s]", text, t_stt)
 
@@ -418,12 +465,23 @@ async def diag(key: str = ""):
     out: dict = {"oido": STT_MODEL, "cerebro": LLM_MODEL, "voz": TTS_VOICE}
 
     pcm = None
-    t = time.monotonic()
+    for label, eng in (("1a_voz_edge", "edge"), ("1b_voz_respaldo", "gtts")):
+        t = time.monotonic()
+        try:
+            if eng == "edge":
+                mp3 = await _edge_mp3("Hola, soy tu robot. Estoy probando mi voz.")
+            else:
+                mp3 = await _gtts_mp3("Hola, soy tu robot. Estoy probando mi voz.")
+            p = await asyncio.to_thread(_decode_mp3, mp3)
+            pcm = pcm or p
+            out[label] = f"OK ({time.monotonic() - t:.1f} s, {len(p) / 2 / OUT_RATE:.1f} s de audio)"
+        except Exception as e:  # noqa: BLE001
+            out[label] = f"FALLA: {type(e).__name__}: {str(e)[:120]}"
     try:
-        pcm = await tts_pcm("Hola, soy tu robot. Estoy probando mi voz.")
-        out["1_voz"] = f"OK ({time.monotonic() - t:.1f} s, {len(pcm) / 2 / OUT_RATE:.1f} s de audio)"
-    except Exception as e:  # noqa: BLE001
-        out["1_voz"] = "FALLA: " + repr(e)[:300]
+        from importlib.metadata import version as _v
+        out["edge_tts_version"] = _v("edge-tts")
+    except Exception:  # noqa: BLE001
+        out["edge_tts_version"] = "?"
 
     if pcm:
         t = time.monotonic()
