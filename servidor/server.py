@@ -78,19 +78,26 @@ app = FastAPI()
 
 
 def build_system_prompt() -> str:
-    """Se vuelve a leer negocio.md en cada conexión: editarlo no requiere tocar el código."""
-    negocio_path = BASE_DIR / "negocio.md"
-    negocio = negocio_path.read_text(encoding="utf-8") if negocio_path.exists() else ""
+    """Se leen personalidad.md y negocio.md en cada conexión: editarlos no requiere tocar el código."""
+    def leer(nombre: str, por_defecto: str = "") -> str:
+        p = BASE_DIR / nombre
+        return p.read_text(encoding="utf-8") if p.exists() else por_defecto
+
+    personalidad = leer(
+        "personalidad.md",
+        "Eres un robot con voz, cercano y relajado. Hablas en español, con frases cortas.",
+    )
+    negocio = leer("negocio.md")
     return (
-        "Eres un robot asistente con voz, amable y cercano. Hablas siempre en español "
-        "(chileno neutro), con frases cortas y naturales, como en una conversación real. "
-        "Responde en 1 a 3 frases salvo que te pidan más detalle. No uses listas, símbolos, "
-        "emojis ni formato: tu respuesta se va a oír, no a leer. Escribe los números y precios "
-        "con palabras, por ejemplo 'cinco mil pesos'.\n\n"
-        "Cuando atiendas a clientes del negocio, usa SOLO la información de abajo para "
-        "precios, servicios y horarios. Si te preguntan algo que no está ahí, di que no "
-        "tienes ese dato y ofrece avisarle al dueño. Nunca inventes precios.\n\n"
-        "=== INFORMACIÓN DEL NEGOCIO ===\n" + negocio
+        personalidad
+        + "\n\n=== REGLAS DE FORMATO (siempre) ===\n"
+        "Tu respuesta se va a oír, no a leer: sin listas, símbolos, emojis ni formato. "
+        "Escribe los números y precios con palabras, por ejemplo 'cinco mil pesos'.\n\n"
+        "=== INFORMACIÓN DEL NEGOCIO ===\n"
+        "Para precios, servicios y horarios usa SOLO la información de abajo. Si te preguntan "
+        "algo del negocio que no está ahí, dilo con naturalidad y sugiere consultarle al dueño. "
+        "Nunca inventes precios. Para todo lo demás (conversar, opinar, bromear) habla libremente.\n\n"
+        + negocio
     )
 
 
@@ -235,7 +242,7 @@ async def llm_stream(messages: list):
         messages=messages,
         stream=True,
         max_completion_tokens=600,
-        temperature=0.5,
+        temperature=float(os.environ.get("LLM_TEMP", "0.8")),   # más alto = más natural y menos predecible
     )
     if "gpt-oss" in LLM_MODEL:
         kwargs["reasoning_effort"] = "low"   # menos "pensar" interno = menos espera
